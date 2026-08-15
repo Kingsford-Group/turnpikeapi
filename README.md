@@ -189,7 +189,7 @@ $$
 The observed-only step is
 
 $$
-z_{t+1}=\operatorname{unit}(\operatorname{pav}(g_t)).
+z_{t+1}=\mathrm{unit}(\mathrm{pav}(g_t)).
 $$
 
 Thus `bstep` is one exact projected coordinate-ascent step for
@@ -213,8 +213,8 @@ The implementation fills each missing row with its current prediction $Q_0z_t$
 and returns
 
 $$
-z_{t+1}=\operatorname{unit}\!\left(
-  \operatorname{pav}(g_t+L_0z_t)
+z_{t+1}=\mathrm{unit}\!\left(
+  \mathrm{pav}(g_t+L_0z_t)
 \right).
 $$
 
