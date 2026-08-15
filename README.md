@@ -1,33 +1,38 @@
 # turnpike
 
 A Python package, with C++17 kernels, for reconstructing one-dimensional point
-sets from **unordered pairwise distances** — the Turnpike problem and its
-circular counterpart, the Beltway problem — including the case where the
-distance measurements are uncertain.
+sets from **unordered pairwise distances** — the Turnpike problem — including
+uncertain, structured, and incomplete observations.
 
 ## The problem
 
 Given a set of `n` points on a line, you can read off all `m = n(n-1)/2`
 pairwise distances between them. The Turnpike problem is the inverse: you are
 handed that multiset of distances *with no indication of which pair produced
-which distance*, and asked to recover the original points. The Beltway problem
-is the same question with the points arranged on a circle.
+which distance*, and asked to recover the original points. The related Beltway
+problem places the points on a circle.
 
-This arises in practice whenever an instrument reports distances but does not
-associate them with the entities that produced them — partial digestion in
-genomic mapping, molecular structure determination, tandem mass spectrometry,
-and DNA-based error-correcting codes among them.
+The same loss of correspondence arises in partial digestion for genomic mapping,
+molecular structure determination, tandem mass spectrometry, and DNA-based
+error-correcting codes.
 
-Exact Turnpike is tractable in practice, but **both problems become strongly
-NP-hard once the measurements carry any uncertainty**, which is the regime every
-real instrument operates in. This package implements three approaches to that
-uncertain regime, trading off scale against the strength of the guarantee:
+Exact Turnpike has practical reconstruction algorithms, although its worst-case
+complexity remains open. Bounded-error Turnpike and related noisy variants are
+strongly NP-hard, and real observations are also commonly rounded, incomplete,
+or duplicated. The package therefore combines large-scale fixed-point fitting,
+moderate-size global fitting, and exact or diagnostic certification:
 
-| Approach | Scales to | Guarantee |
+| Approach | Regime | Guarantee |
 |---|---|---|
-| Majorization–minimization (MM) | ~10⁵ points | local/fixed-point; no global claim |
-| Sorting-network MILP | moderate `n` | global best fit, solver-certified |
-| Triangle-equality LP/ILP | moderate `n` | exact integer certificate of realizability |
+| Streaming coordinate ascent / MM | ~10⁵ points | fixed-point method; no local or global optimality claim |
+| Sorting-network MILP | moderate `n` | solver-reported global best fit within the supplied span bound |
+| Triangle-equality LP/ILP | moderate `n` | exact realizability certificate only when integral and post-verified |
+
+**Beltway** is handled through the missing-distance machinery rather than a
+separate code path: in the real-arithmetic model, Beltway on `n` points reduces
+to Turnpike with missing distances on `2n + 1` points, and the partitioned
+routines below are exactly what that reduction requires. The reduction itself is
+laid out in the MM work.
 
 ## Provenance
 
@@ -47,9 +52,10 @@ the PhD dissertation of C. S. Elder:
    [arXiv:2603.18283](https://arxiv.org/abs/2603.18283) — the triangle
    certificates.
 
-The papers are the mathematical authority; this package is the reference
-implementation. Where the two diverge, one such case is documented explicitly
-below under *partitioned MM*.
+The papers give the original formulations; this package is their reference
+implementation. One distinction is easy to miss in the journal presentation and
+is made explicit below: the observed-only and missing-row-imputation updates
+optimize **different objectives**.
 
 ## Install
 
@@ -82,10 +88,40 @@ array([[0, 1], [0, 2], [1, 2], [0, 3], [1, 3], [2, 3]])
 Rank ties are resolved by predicted value, then shorter interval, then smaller
 left endpoint.
 
-## Majorization–minimization
+## Full-data coordinate ascent and MM
 
-The scalable solver. Each iteration runs in `O(m log m)` time and `O(√m)`
-working space, which is what lets it reach instances of ~100,000 points.
+The scalable full-data solver uses the j-major difference matrix $Q$ and the
+centered, sorted unit search space
+
+$$
+\mathcal Z_n=\{z\in\mathbb R^n:\mathbf 1^\top z=0,\ \lVert z\rVert_2=1,
+z_1\le\cdots\le z_n\}.
+$$
+
+For a current $z$, let $P(z)$ denote the deterministic co-sorting of the input
+distances $d$ with the predicted differences $Qz$. One update is
+
+$$
+u=Q^\top P(z)d,\qquad z^+=u/\lVert u\rVert_2.
+$$
+
+This is exact two-block coordinate ascent on
+
+$$
+\max_{z\in\mathcal Z_n,\;P\in\mathcal S_m}\langle Qz,Pd\rangle.
+$$
+
+It is also MM on the profiled objective
+$\Phi(z)=\max_P\langle Qz,Pd\rangle$: the active branch
+$G_t(z)=\langle Qz,P_t d\rangle$ is a global minorizer of $\Phi$ that touches it
+at the current iterate. Because $\lVert Qz\rVert_2^2=n$ on $\mathcal Z_n$,
+maximizing this correlation is equivalent to minimizing the complete-data half
+squared loss. No PAV projection is needed in the full-data update: canonical
+co-sorting makes $u$ nondecreasing.
+
+After sorting `d` once, the streaming kernel takes `O(m log n)` time per
+iteration and `O(n) = O(√m)` auxiliary words beyond the stored distances and
+outputs. This is the structure behind the ~100,000-point scale.
 
 ```python
 import numpy as np
@@ -103,40 +139,125 @@ Smaller primitives keep the mathematically distinct outputs explicit:
 - `raw(d, z)` → `u = Q.T @ P(z) @ d`
 - `step(d, z)` → `u / ||u||`
 - `fit(d, z)` → the centered regression `u / n`
+- `mm(d, z)` → iterates the normalized assignment–coordinate update
 - `solve(d, z)` → iterates MM, regresses the final assignment, anchors at zero
 
-**MM is a deterministic local/fixed-point method, not a global reconstruction
-guarantee.** `max_iter` and the normalized-iterate tolerance are always
-retained. Internally the iteration ranks an unscaled raw representative and
-keeps a separate unit vector for stopping and output; this prevents
-floating-point normalization from splitting exact interval ties.
+In exact arithmetic with deterministic ties, the uncapped map has a finite
+assignment image and reaches a fixed point after finitely many iterations. The
+floating-point APIs retain `tol` and `max_iter`. A fixed point need not be a
+local or global optimum, so no reconstruction-optimality guarantee is claimed.
+Internally the iteration ranks an unscaled raw representative and keeps a
+separate unit vector for stopping and output; this prevents normalization from
+splitting exact interval ties.
 
-## Partitioned MM
+## Partitioned updates: correlation ascent and imputation MM
 
-For distances observed in groups rather than as one undifferentiated multiset.
-Each observed cell is a multiset `D[c]` assigned to intervals `I[c]`, specified
+For distances observed in groups rather than as one undifferentiated multiset,
+each observed cell is a multiset `D[c]` assigned to intervals `I[c]`, specified
 by j-major row indices or `(i, j)` pairs. Cells are disjoint; omitted intervals
 are treated as missing.
 
 ```python
-D = [np.array([1, 1, 7, 7]), np.array([6, 8])]
-I = [np.array([0, 1, 4, 5]), np.array([2, 3])]
+D = [np.array([1, 1, 7]), np.array([6, 8])]
+I = [np.array([0, 1, 4]), np.array([2, 3])]  # interval row 5 is missing
 
-z = tp.bmm(D, I, [0, 1, 2, 8])
+z_corr = tp.bmm(D, I, [0, 1, 2, 8])
+z_loss = tp.impute(D, I, [0, 1, 2, 8])
 ```
 
-`bmm` implements products of independent symmetric cells; a fixed assignment is
-a singleton cell. General permutation families need their own assignment oracle
-and are not silently treated as cells.
+The implementation supports products of independent exchangeable cells. A fixed
+assignment is a singleton cell; a general permutation family needs its own exact
+assignment oracle and is not silently treated as a cell. The two public API
+pairs share the same cellwise assignment and unweighted coordinate-space PAV
+machinery, but they optimize different objectives when rows are missing:
 
-The observed-only update is `unit(pav(Q_obs.T @ P @ D))`. The PAV projection is
-necessary — independently co-sorted cells can produce a nonmonotone gradient.
+- `bstep(D, I, z)` / `bmm(D, I, z, tol=..., max_iter=...)` perform
+  observed-correlation projected ascent; omitted rows contribute zero.
+- `impute_step(D, I, z)` / `impute(D, I, z, tol=..., max_iter=...)` perform
+  imputation MM for profiled observed half squared loss; omitted rows contribute
+  their current predictions to the surrogate only.
 
-> **Known divergence from the journal paper.** This corrects a seam in that
-> presentation, whose displayed objective omits the null block although its
-> pseudocode imputes it. `impute` and `impute_step` retain the original
-> missing-data update under a separate, diagnostic contract; they do **not**
-> inherit the observed-objective monotonicity claim.
+For cell $c$, let $Q_c$ contain its interval rows and let $P_{c,t}$ be the
+co-sorted assignment at the current normalized iterate $z_t$. Define
+
+$$
+g_t=\sum_c Q_c^\top P_{c,t}D_c,
+\qquad
+\Phi_{\mathrm{corr}}(z,P)=\sum_c\langle Q_cz,P_cD_c\rangle.
+$$
+
+The observed-only step is
+
+$$
+z_{t+1}=\operatorname{unit}(\operatorname{pav}(g_t)).
+$$
+
+Thus `bstep` is one exact projected coordinate-ascent step for
+$\Phi_{\mathrm{corr}}$, and `bmm` iterates it. PAV is necessary because
+independently co-sorted cells can make $g_t$ nonmonotone. With deterministic
+ties, the exact uncapped `bmm` map reaches a fixed point finitely; the
+floating-point routine uses `tol` and `max_iter`. If rows are missing, this
+correlation objective is not observed least squares because
+$\sum_c\lVert Q_cz\rVert_2^2$ varies with $z$.
+
+For the imputation mode, let $Q_0$ contain the missing rows,
+$L_0=Q_0^\top Q_0$, and
+
+$$
+L_{\mathrm{obs}}(z,P)=\frac12\sum_c\lVert Q_cz-P_cD_c\rVert_2^2,
+\qquad
+\rho(z)=\min_P L_{\mathrm{obs}}(z,P).
+$$
+
+The implementation fills each missing row with its current prediction $Q_0z_t$
+and returns
+
+$$
+z_{t+1}=\operatorname{unit}\!\left(
+  \operatorname{pav}(g_t+L_0z_t)
+\right).
+$$
+
+This update exactly minimizes the tight global majorizer
+
+$$
+G_t(z)=L_{\mathrm{obs}}(z,P_t)
+       +\frac12\lVert Q_0(z-z_t)\rVert_2^2.
+$$
+
+Indeed, $\rho(z)\le L_{\mathrm{obs}}(z,P_t)\le G_t(z)$ for every $z$, while
+$G_t(z_t)=\rho(z_t)$. Consequently, in exact arithmetic,
+
+$$
+\rho(z_{t+1})\le G_t(z_{t+1})\le G_t(z_t)=\rho(z_t),
+$$
+
+with strict decrease when the normalized iterate changes. Missing predictions
+are optimization-transfer terms, not observations. Because the surrogate
+depends continuously on $z_t$, finite assignment space does not imply finite
+termination for `impute`; the guarantee is monotone, bounded profiled-loss
+values, not global optimality or convergence of the iterates.
+
+> **Clarification relative to the journal presentation.** Its displayed
+> observed-only objective omits the null block, while its pseudocode fills that
+> block with current predictions. The API exposes both mathematically distinct
+> updates. `bstep`/`bmm` are correlation ascent; `impute_step`/`impute` implement
+> the pseudocode and are genuine MM for $\rho$. They therefore guarantee
+> observed-loss descent, not observed-correlation ascent.
+
+If no intervals are missing, $Q_0$ is empty and the two modes coincide:
+`impute_step` equals `bstep`, and `impute` equals `bmm`, up to floating-point
+roundoff. If one exchangeable cell contains every row, PAV is inactive and these
+calls reduce to `step` and `mm`.
+
+A three-point example shows why the two objectives cannot be conflated. Using
+the API's zero-based endpoints, observe singleton distance 1 on `(0, 1)` and
+distance 2 on `(0, 2)`, omit `(1, 2)`, and take
+$z_t=(-5,1,4)/\sqrt{42}$. One `impute_step` lowers observed correlation from
+approximately `3.703280` to `3.690960` while lowering profiled observed half
+squared loss from approximately `0.189577` to `0.188267` — exactly the behavior
+promised by the imputation-MM contract, and impossible for a correlation-ascent
+step.
 
 ## Sorting-network MILP
 
@@ -185,11 +306,11 @@ without requiring a solver-specific C++ layer.
 
 This distinction is deliberate and load-bearing:
 
-| Outcome | Meaning |
+| Mode or returned result | Meaning |
 |---|---|
-| ILP | exact spine basis and rank pruning |
-| LP | full triangle system |
-| integral LP `P` | realizability certificate |
+| `triangle(..., lp=False)` | ILP with spine basis and rank pruning by default |
+| `triangle(..., lp=True)` | LP with the full triangle system by default |
+| integral, exactly post-verified `P` | realizability certificate (`guaranteed=True`) |
 | fractional LP `P` | relaxation diagnostic — **not** a nonrealizability certificate |
 | infeasible LP/ILP | solver-reported nonrealizability for the supplied relations; no independently checkable infeasibility proof artifact is returned |
 

@@ -65,13 +65,25 @@ def _bstep(D, I, z, impute):
 
 @vectors("z")
 def bstep(D, I, z):
-    """Return one observed-only projected block-MM step."""
+    """Return one observed-correlation coordinate-ascent step.
+
+    Omitted intervals contribute zero. This ascends the observed correlation
+    sum_c <Q_c z, P_c D_c>; when rows are missing that is not observed least
+    squares, since sum_c ||Q_c z||^2 then varies with z. Use `impute_step` for
+    the profiled observed loss.
+    """
     return _bstep(D, I, z, False)
 
 
 @vectors("z")
 def impute_step(D, I, z):
-    """Return one diagnostic block step with missing intervals imputed."""
+    """Return one profiled-observed-loss imputation-MM step.
+
+    Missing rows are filled with their current predictions and enter the
+    surrogate only; they are optimization-transfer terms, not observations.
+    The step exactly minimizes a tight global majorizer of the profiled
+    observed half squared loss, so that loss is nonincreasing.
+    """
     return _bstep(D, I, z, True)
 
 
@@ -90,11 +102,23 @@ def _bmm(D, I, z, tol, max_iter, impute):
 
 @vectors("z")
 def bmm(D, I, z, tol=1e-10, max_iter=1000):
-    """Iterate observed-only block MM; unlisted intervals contribute zero."""
+    """Iterate observed-correlation coordinate ascent.
+
+    Unlisted intervals contribute zero. With deterministic ties the exact
+    uncapped map reaches a fixed point finitely; this floating-point routine
+    stops on `tol` or `max_iter`. A fixed point need not be optimal.
+    """
     return _bmm(D, I, z, tol, max_iter, False)
 
 
 @vectors("z")
 def impute(D, I, z, tol=1e-10, max_iter=1000):
-    """Iterate the historical null-imputing block update."""
+    """Iterate profiled-observed-loss imputation MM.
+
+    Missing rows enter the surrogate only. Each step minimizes a tight global
+    majorizer, so the profiled observed half squared loss is nonincreasing.
+    The surrogate depends continuously on the current iterate, so a finite
+    assignment space does not imply finite termination here; the guarantee is
+    monotone bounded loss values, not global optimality.
+    """
     return _bmm(D, I, z, tol, max_iter, True)
